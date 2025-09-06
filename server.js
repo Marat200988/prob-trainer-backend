@@ -1,95 +1,134 @@
+// server.js
 import express from 'express'
 import fetch from 'node-fetch'
 import cors from 'cors'
 
+/**
+ * Быстрый логгер с метками
+ */
+function log(level, msg, obj) {
+  const line = `[${new Date().toISOString()}] ${level.toUpperCase()}: ${msg}`
+  if (obj !== undefined) {
+    console.log(line, typeof obj === 'string' ? obj : JSON.stringify(obj))
+  } else {
+    console.log(line)
+  }
+}
+
+/**
+ * Достаёт первый корректный JSON из строки (если вокруг есть текст).
+ */
+function extractJson(str) {
+  let depth = 0
+  let start = -1
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i]
+    if (ch === '{') {
+      if (depth === 0) start = i
+      depth++
+    } else if (ch === '}') {
+      depth--
+      if (depth === 0 && start !== -1) {
+        const candidate = str.slice(start, i + 1)
+        try {
+          return JSON.parse(candidate)
+        } catch {
+          // продолжаем искать следующий блок
+        }
+      }
+    }
+  }
+  throw new Error('JSON not found in content')
+}
+
 const app = express()
 app.use(express.json())
-app.use(cors({
-  origin: process.env.ALLOW_ORIGIN || '*',
-}))
 
-// healthcheck
+app.use(
+  cors({
+    origin: process.env.ALLOW_ORIGIN || '*',
+  })
+)
+
+// --- healthcheck ---
 app.get('/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() })
 })
 
-// --- утилиты ---
-function extractJson(text) {
-  const match = text.match(/\{[\s\S]*\}/)
-  if (match) {
-    try { return JSON.parse(match[0]) } catch {}
-  }
-  throw new Error('No valid JSON in response')
-}
-function getDeepseekKey() {
-  // Поддержим оба имени, срежем "Bearer " и пробелы
-  const raw = (process.env.DEEPSEEK_KEY || process.env.DEEPSEEK_API_KEY || '').trim()
-  return raw.replace(/^Bearer\s+/i, '')
-}
-
+/**
+ * Генерация вопросов через DeepSeek
+ * body: { sections: [{id,title}...], count: number }
+ */
 app.post('/gen-questions', async (req, res) => {
-  try {
-    console.log('gen-questions body:', JSON.stringify(req.body))
-    const apiKey = getDeepseekKey()
+  const body = req.body || {}
+  log('info', 'gen-questions body:', body)
 
-    if (!apiKey) {
-      console.error('[deepseek] API key missing')
-      return res.status(500).json({ error: 'DeepSeek API key is missing on server' })
-    }
-    // безопасный лог без утечки секрета
-    console.log('[deepseek] keyPresent=true len=', apiKey.length)
+  const apiKey = process.env.DEEPSEEK_KEY || process.env.DEEPSEEK_API_KEY
+  if (!apiKey) {
+    return res.status(500).json({ error: 'Missing DEEPSEEK_KEY env var' })
+  }
+
+  try {
+    // Формируем минимальный промпт
+    const sys = 'You are a tutor that outputs STRICT JSON only.'
+    const user = `Generate ${body.count || 6} short probability questions for sections: ${JSON.stringify(
+      body.sections || []
+    )}.
+Return pure JSON of the shape:
+{"questions":[{"id":"string","section_id":"string","title":"string","type":"mcq|num","content_md":"string","options":["A","B","C","D"],"answer":"A","explanation_md":"string"}]}`
 
     const dsResp = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model: 'deepseek-reasoner',
-        temperature: 0.4,
-        response_format: { type: 'json_object' }, // требуем строго JSON
         messages: [
-          {
-            role: 'system',
-            content:
-`Ты — генератор задач по теории вероятностей.
-Верни СТРОГО JSON:
-{"questions":[{"id":"string","section_id":"string","type":"mcq|numeric|confidence","question":"string","options":["..."]|null,"answer":"string|number|{ \\"option\\": \\"...\\", \\"confidence\\": 0-1 }","explanation":"string","learn_url":"string"}]}`
-          },
-          {
-            role: 'user',
-            content: `Сгенерируй ${req.body.n || 3} вопросов из разных разделов.`
-          }
-        ]
+          { role: 'system', content: sys },
+          { role: 'user', content: user },
+        ],
+        temperature: 0.7,
       }),
     })
 
     const text = await dsResp.text()
-    console.log('DeepSeek status =', dsResp.status)
-    console.log('DeepSeek raw body =', text.slice(0, 180))
+    log('info', 'DeepSeek status = ' + dsResp.status)
+    log('info', 'DeepSeek raw body (head) =', text.slice(0, 300))
 
     if (!dsResp.ok) {
-      // пробрасываем тело для дебага (без ключей)
-      return res.status(502).json({ error: 'DeepSeek error', status: dsResp.status, body: text })
+      return res
+        .status(502)
+        .json({ error: 'DeepSeek error', status: dsResp.status, body: text })
     }
+
+    // общий объект ответа
+    const data = JSON.parse(text)
+
+    // контент с ответом модели
+    const content = data?.choices?.[0]?.message?.content ?? ''
+    log('debug', 'DeepSeek content (head) = ' + content.slice(0, 200))
 
     let parsed
     try {
-      parsed = JSON.parse(text)
-    } catch (e) {
-      console.warn('Parse JSON fail, fallback extract:', e.message)
-      parsed = extractJson(text)
+      parsed = JSON.parse(content) // если пришёл «чистый» JSON
+    } catch {
+      parsed = extractJson(content) // вырезаем JSON из текста
     }
 
-    res.json(parsed)
+    // простая валидация
+    const n = Array.isArray(parsed?.questions) ? parsed.questions.length : 0
+    log('debug', 'parsed.questions count = ' + n)
+
+    return res.json(parsed)
   } catch (err) {
-    console.error('gen-questions ERROR', err)
-    res.status(500).json({ error: String(err) })
+    log('error', 'gen-questions ERROR', String(err))
+    return res.status(500).json({ error: String(err) })
   }
 })
 
 const port = process.env.PORT || 3000
 app.listen(port, () => {
-  console.log('Server listening on port', port)
+  log('info', `Server listening on port ${port}`)
 })
