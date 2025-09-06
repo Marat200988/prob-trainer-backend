@@ -68,9 +68,9 @@ function normalizeQuestion(q, i) {
     (q.question ? String(q.question) : "") ||
     plainFromMd(content_md).split(". ").slice(0, 1).join(". ") ||
     `Вопрос ${i + 1}`;
-  const question = q.question || ""; // оставим как прислал LLM (может быть пустым)
+  const question = q.question || "";
   const type = q.type || "mcq";
-  const answer = q.answer || null; // может пригодиться в чекере
+  const answer = q.answer || null;
 
   return {
     id,
@@ -78,9 +78,10 @@ function normalizeQuestion(q, i) {
     title,
     question,
     content_md,
-    options, // [{key, text}]
+    options,
     type,
     answer,
+    explanation_md: q.explanation_md || q.explanationMd || q.explanation || "",
   };
 }
 
