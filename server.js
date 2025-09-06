@@ -1,7 +1,7 @@
-// server.js
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
@@ -11,219 +11,184 @@ app.use(
   })
 );
 
-let LAST_QUESTIONS = [];
+// === helpers ===============================================================
 
-// -------- helpers ----------
-function stripCodeFences(s = "") {
-  return s.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
-}
+const DS_MODEL = process.env.DS_MODEL || "deepseek-chat"; // быстрее, чем reasoner
+const DS_API_KEY = process.env.DEEPSEEK_API_KEY;
 
-function tryParseJSON(s = "") {
-  if (!s) return null;
-  // часто модель присылает текст + JSON в код-блоке
-  let t = stripCodeFences(s);
-  // если вокруг есть пояснения, пытаемся выдрать первый большой JSON
-  const first = t.indexOf("{");
-  const last = t.lastIndexOf("}");
-  if (first !== -1 && last !== -1 && last > first) {
-    t = t.slice(first, last + 1);
+const toText = (v) => {
+  if (typeof v === "string" || typeof v === "number") return String(v);
+  if (v && typeof v === "object") {
+    const cand =
+      v.text ?? v.label ?? v.value ?? v.content ?? v.title ?? v.name;
+    return typeof cand === "string" || typeof cand === "number"
+      ? String(cand)
+      : JSON.stringify(v);
   }
-  try {
-    return JSON.parse(t);
-  } catch {
-    return null;
-  }
-}
+  return String(v ?? "");
+};
 
-function normalizeOptions(raw) {
-  if (!raw) return [];
-  if (Array.isArray(raw))
-    return raw.map((v, i) => ({
-      key: ["A", "B", "C", "D", "E", "F", "G"][i] || String(i + 1),
-      text: String(v ?? ""),
-    }));
-  if (typeof raw === "object")
-    return Object.entries(raw).map(([k, v]) => ({
+function normalizeQuestion(q) {
+  const letters = ["A","B","C","D","E","F","G","H","I"];
+
+  // options: массив/словарь → [{key,text}]
+  let options = [];
+  if (Array.isArray(q.options)) {
+    options = q.options.map((o, i) => {
+      if (o && typeof o === "object") {
+        const key = o.key ?? o.id ?? letters[i] ?? String(i + 1);
+        return { key: String(key), text: toText(o.text ?? o) };
+      }
+      return { key: letters[i] ?? String(i + 1), text: toText(o) };
+    });
+  } else if (q.options && typeof q.options === "object") {
+    options = Object.entries(q.options).map(([k, v]) => ({
       key: String(k),
-      text: String(v ?? ""),
+      text: toText(v),
     }));
-  return [];
-}
-
-function plainFromMd(md = "") {
-  return String(md || "")
-    .replace(/`{1,3}.*?`{1,3}/gs, "")
-    .replace(/[*_#>\[\]()`]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeQuestion(q, i) {
-  const id = q.id || `q${i + 1}`;
-  const section_id = q.section_id || "misc";
-  const options = normalizeOptions(q.options);
-  const content_md = q.content_md || q.contentMd || q.content || "";
-  const title =
-    q.title ||
-    (q.question ? String(q.question) : "") ||
-    plainFromMd(content_md).split(". ").slice(0, 1).join(". ") ||
-    `Вопрос ${i + 1}`;
-  const question = q.question || "";
-  const type = q.type || "mcq";
-  const answer = q.answer || null;
+  }
 
   return {
-    id,
-    section_id,
-    title,
-    question,
-    content_md,
+    id: q.id ?? q.qid ?? crypto.randomUUID(),
+    section_id: q.section_id ?? q.section ?? "",
+    title: toText(q.title ?? ""),
+    question: toText(q.question ?? ""),
+    content_md: toText(q.content_md ?? q.content ?? ""),
+    type: q.type ?? "mcq",
     options,
-    type,
-    answer,
-    explanation_md: q.explanation_md || q.explanationMd || q.explanation || "",
+    answer:
+      typeof q.answer === "string" ? q.answer : toText(q.answer ?? ""),
+    explanation_md: toText(q.explanation_md ?? q.explanation ?? ""),
   };
 }
 
-// -------- routes ----------
-app.get("/health", (_req, res) => {
+// очень простой in-memory cache
+const CACHE = {
+  questions: [],
+  at: 0,
+};
+
+// === endpoints =============================================================
+
+app.get("/health", (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
 app.post("/gen-questions", async (req, res) => {
   try {
-    console.log("INFO: gen-questions body:", JSON.stringify(req.body));
+    const { sections = [], count = 6, language = "ru" } = req.body || {};
+    console.log("INFO: gen-questions body:", JSON.stringify({ sections, count }));
 
-    const body = {
-      model: "deepseek-chat", // быстрее, чем deepseek-reasoner
-      messages: [
-        {
-          role: "system",
-          content:
-            "Ты генератор тренировочных задач по вероятности. Отвечай ТОЛЬКО валидным JSON без пояснений.",
-        },
-        {
-          role: "user",
-          content: JSON.stringify(
-            {
-              instruction:
-                "Сгенерируй N=6 разных задач по вероятности с ответами. Каждая задача — формат 'mcq'.",
-              format: {
-                questions: [
-                  {
-                    id: "q1",
-                    section_id: "bayes",
-                    title: "Короткий заголовок",
-                    question: "Один абзац формулировки (может быть пустым)",
-                    content_md:
-                      "Полный текст в Markdown (можно объединить с формулировкой).",
-                    options: {
-                      A: "вариант",
-                      B: "вариант",
-                      C: "вариант",
-                      D: "вариант",
-                    },
-                    answer: "A",
-                    explanation_md:
-                      "Короткое объяснение решения и формулами в Markdown.",
-                    type: "mcq",
-                  },
-                ],
-              },
-              language: "ru",
-              sections: req.body?.sections || [],
-              count: req.body?.count || 6,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-      temperature: 0.6,
-      max_tokens: 2000,
-    };
+    const sys = [
+      "Ты – генератор тренировочных задач по вероятности.",
+      "Отвечай СТРОГО JSON, без лишнего текста.",
+      "Схема ответа:",
+      "{",
+      '  "questions": [',
+      "    {",
+      '      "id": "q1",',
+      '      "section_id": "bayes",',
+      '      "title": "Короткий заголовок",',
+      '      "question": "Формулировка задачи",',
+      '      "content_md": "Доп. контент (может быть пустым)",',
+      '      "type": "mcq",',
+      '      "options": { "A": "вариант", "B": "вариант", "C": "вариант", "D": "вариант" },',
+      '      "answer": "A",',
+      '      "explanation_md": "Краткое объяснение"',
+      "    }",
+      "  ]",
+      "}",
+      "Все значения — строки. НЕ возвращай вложенных объектов в options.",
+    ].join("\n");
+
+    const user = [
+      `Язык: ${language}.`,
+      `Нужно сгенерировать ${count} вопросов. Разделы:`,
+      JSON.stringify(sections),
+      "Темы — базовые вероятности, Байес, матожидание, хвостовые риски, интуитивные ловушки.",
+    ].join("\n");
 
     const dsResp = await fetch("https://api.deepseek.com/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${DS_API_KEY}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model: DS_MODEL,
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: user },
+        ],
+        temperature: 0.4,
+      }),
     });
 
     console.log("INFO: DeepSeek status =", dsResp.status);
-    const respText = await dsResp.text();
-    console.log("INFO: DeepSeek raw body (head) =", respText.slice(0, 200));
+    const text = await dsResp.text();
+    console.log("INFO: DeepSeek raw body (head) =", text.slice(0, 500));
 
     if (!dsResp.ok) {
-      return res
-        .status(dsResp.status)
-        .json({ error: "DeepSeek API error", detail: respText });
+      return res.status(502).json({ error: "DeepSeek error", body: text });
     }
 
-    // Разбираем JSON DeepSeek и достаем message.content (тоже JSON-строка)
-    let outer;
+    // иногда модель оборачивает JSON в ```json ... ```
+    const match = text.match(/```json\s*([\s\S]*?)```/i);
+    const jsonText = match ? match[1] : text;
+
+    let data;
     try {
-      outer = JSON.parse(respText);
-    } catch {
-      // крайне редко, но на всякий тюнинг
-      outer = tryParseJSON(respText);
-    }
-    const content = outer?.choices?.[0]?.message?.content || "";
-    const parsed = tryParseJSON(content);
-
-    if (!parsed?.questions?.length) {
-      return res
-        .status(502)
-        .json({ error: "Invalid model response", content: content.slice(0, 300) });
+      data = JSON.parse(jsonText);
+    } catch (e) {
+      return res.status(500).json({ error: "JSON parse fail", body: text });
     }
 
-    const questions = parsed.questions.map(normalizeQuestion);
-    LAST_QUESTIONS = questions; // используем в /check-answer
+    const questions = Array.isArray(data?.questions) ? data.questions : [];
+    const normalized = questions.map(normalizeQuestion);
 
-    console.log("DEBUG: cached", questions.length, "questions");
-    res.json({ questions });
+    CACHE.questions = normalized;
+    CACHE.at = Date.now();
+
+    console.log("DEBUG: cached", normalized.length, "questions");
+    res.json(normalized);
   } catch (err) {
-    console.error("gen-questions ERROR:", err);
+    console.error("ERROR /gen-questions:", err);
     res.status(500).json({ error: String(err) });
   }
 });
 
 app.post("/check-answer", async (req, res) => {
   try {
-    const { questionId, userAnswer } = req.body || {};
-    const q = LAST_QUESTIONS.find((x) => x.id === questionId);
+    const { qid, userAnswer, confidence } = req.body || {};
+    const q = CACHE.questions.find((x) => x.id === qid);
+    if (!q) return res.status(404).json({ error: "question not found" });
 
-    if (!q) {
-      return res
-        .status(404)
-        .json({ error: "Question not found (maybe cache reset)" });
+    const correct = String(userAnswer).trim() === String(q.answer).trim();
+
+    // опционально считаем Brier, если фронт передал confidence [0..1]
+    let brier = undefined;
+    if (typeof confidence === "number" && confidence >= 0 && confidence <= 1) {
+      const p = confidence;
+      const y = correct ? 1 : 0;
+      brier = (p - y) * (p - y);
     }
 
-    // сравниваем по ключу опции (A/B/C/...)
-    const correctAnswer = q.answer || null; // если модель прислала
-    const correct =
-      correctAnswer &&
-      String(correctAnswer).trim().toUpperCase() ===
-        String(userAnswer).trim().toUpperCase();
-
-    // простой Brier без вероятности (слайдер вы не присылаете на бэк)
-    const brier = Number(correct ? 0 : 0.49);
-
     res.json({
-      correct: Boolean(correct),
-      correctAnswer: correctAnswer || null,
+      correct,
+      correctAnswer: q.answer,
       brier,
       explanation_md: q.explanation_md || "",
     });
   } catch (err) {
-    console.error("check-answer ERROR:", err);
+    console.error("ERROR /check-answer:", err);
     res.status(500).json({ error: String(err) });
   }
 });
 
+// === start ================================================================
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log("Server listening on port", port);
+  console.log("Model:", DS_MODEL);
 });
