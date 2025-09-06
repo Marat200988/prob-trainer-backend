@@ -4,7 +4,6 @@ import cors from 'cors'
 
 const app = express()
 app.use(express.json())
-
 app.use(cors({
   origin: process.env.ALLOW_ORIGIN || '*',
 }))
@@ -16,19 +15,19 @@ app.get('/health', (req, res) => {
 
 app.post('/gen-questions', async (req, res) => {
   try {
-    console.log('gen-questions body:', JSON.stringify(req.body).slice(0, 500))
+    console.log('gen-questions body:', JSON.stringify(req.body))
 
-    const dsResp = await fetch('https://api.deepseek.com/chat/completions', {
+    const dsResp = await fetch('https://api.deepseek.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
       },
       body: JSON.stringify({
-        model: 'deepseek-reasoner',   // или "deepseek-chat", если этот не доступен
+        model: 'deepseek-reasoner',
         messages: [
-          { role: 'system', content: 'Generate probability training questions. Answer strictly in JSON {questions:[...]}' },
-          { role: 'user', content: `Generate ${req.body.count || 5} probability theory questions covering sections: ${req.body.sections?.map(s=>s.title).join(', ')}` },
+          { role: 'system', content: 'Generate probability training questions' },
+          { role: 'user', content: `Generate ${req.body.n || 3} questions` },
         ],
         temperature: 0.7,
       }),
@@ -36,20 +35,21 @@ app.post('/gen-questions', async (req, res) => {
 
     const text = await dsResp.text()
     console.log('DeepSeek status=', dsResp.status)
-    console.log('DeepSeek raw body=', text.slice(0, 500))
+    console.log('DeepSeek raw body=', text.slice(0, 200))
 
     if (!dsResp.ok) {
-      return res.status(502).json({ error: 'DeepSeek upstream ' + dsResp.status })
+      return res.status(502).json({ error: 'DeepSeek error', body: text })
     }
 
     const data = JSON.parse(text)
-    const content = data?.choices?.[0]?.message?.content || '{}'
+    const content = data?.choices?.[0]?.message?.content
     let parsed
+
     try {
       parsed = JSON.parse(content)
     } catch (e) {
       console.error('Parse JSON fail:', e, 'content=', content)
-      return res.status(500).json({ error: 'Invalid JSON from DeepSeek' })
+      return res.status(500).json({ error: 'Invalid JSON from DeepSeek', raw: content })
     }
 
     res.json(parsed)
