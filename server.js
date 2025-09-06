@@ -1,8 +1,17 @@
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
-import crypto from "crypto";
 
+// ====== Конфиг ======
+const PORT = process.env.PORT || 10000;
+const DS_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.DS_API_KEY;
+const DS_URL = "https://api.deepseek.com/chat/completions";
+// быстрее и дешевле, чем reasoning:
+const DS_MODEL = "deepseek-chat";
+// "ru" или "en" — можно перекинуть в ENV, но по умолчанию русифицируем
+const LANG = process.env.QUIZ_LANG || "ru";
+
+// ====== App ======
 const app = express();
 app.use(express.json());
 app.use(
@@ -11,184 +20,250 @@ app.use(
   })
 );
 
-// === helpers ===============================================================
-
-const DS_MODEL = process.env.DS_MODEL || "deepseek-chat"; // быстрее, чем reasoner
-const DS_API_KEY = process.env.DEEPSEEK_API_KEY;
-
-const toText = (v) => {
-  if (typeof v === "string" || typeof v === "number") return String(v);
-  if (v && typeof v === "object") {
-    const cand =
-      v.text ?? v.label ?? v.value ?? v.content ?? v.title ?? v.name;
-    return typeof cand === "string" || typeof cand === "number"
-      ? String(cand)
-      : JSON.stringify(v);
-  }
-  return String(v ?? "");
-};
-
-function normalizeQuestion(q) {
-  const letters = ["A","B","C","D","E","F","G","H","I"];
-
-  // options: массив/словарь → [{key,text}]
-  let options = [];
-  if (Array.isArray(q.options)) {
-    options = q.options.map((o, i) => {
-      if (o && typeof o === "object") {
-        const key = o.key ?? o.id ?? letters[i] ?? String(i + 1);
-        return { key: String(key), text: toText(o.text ?? o) };
-      }
-      return { key: letters[i] ?? String(i + 1), text: toText(o) };
-    });
-  } else if (q.options && typeof q.options === "object") {
-    options = Object.entries(q.options).map(([k, v]) => ({
-      key: String(k),
-      text: toText(v),
-    }));
-  }
-
-  return {
-    id: q.id ?? q.qid ?? crypto.randomUUID(),
-    section_id: q.section_id ?? q.section ?? "",
-    title: toText(q.title ?? ""),
-    question: toText(q.question ?? ""),
-    content_md: toText(q.content_md ?? q.content ?? ""),
-    type: q.type ?? "mcq",
-    options,
-    answer:
-      typeof q.answer === "string" ? q.answer : toText(q.answer ?? ""),
-    explanation_md: toText(q.explanation_md ?? q.explanation ?? ""),
-  };
-}
-
-// очень простой in-memory cache
-const CACHE = {
-  questions: [],
-  at: 0,
-};
-
-// === endpoints =============================================================
-
-app.get("/health", (req, res) => {
+// healthcheck
+app.get("/health", (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
+// ====== Утилиты ======
+
+/**
+ * Достаёт JSON из строки DeepSeek.
+ * Срезает обрамляющие ```json ... ``` или любые префиксы до первой { и последние }.
+ */
+function extractJSON(text) {
+  if (!text) return null;
+  let t = String(text).trim();
+
+  // Срезаем маркдаун-кодблоки
+  if (t.startsWith("```")) {
+    // убираем первые ```... (включая возможное слово json)
+    t = t.replace(/^```[a-zA-Z]*\s*/, "");
+    // убираем завершающие ```
+    t = t.replace(/```$/, "").trim();
+  }
+
+  // Иногда модель префиксит "json\n\n"
+  if (t.toLowerCase().startsWith("json")) {
+    t = t.slice(4).trim();
+  }
+
+  // На всякий случай берём подстроку по внешним { ... }
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  const jsonString = t.slice(start, end + 1);
+  try {
+    return JSON.parse(jsonString);
+  } catch (e) {
+    console.error("JSON parse error:", e);
+    return null;
+  }
+}
+
+/**
+ * Вопросы кешируем на 5 минут, чтобы фронт не ждал каждый раз.
+ * Простейший in-memory кеш на процесс.
+ */
+let cache = { key: "", data: null, ts: 0 };
+const CACHE_MS = 5 * 60 * 1000;
+
+// ====== Промпт для генерации ======
+function buildSystemPrompt() {
+  if (LANG === "ru") {
+    return `Ты генератор тренировочных задач по вероятности для начинающих.
+Верни ТОЛЬКО JSON без комментариев и текста, четко по схеме ниже.
+
+Сгенерируй 6 вопросов по секциям, которые пришлет пользователь (id секций важен).
+Каждый вопрос: тип "mcq", 4 варианта, один верный ответ.
+Пиши коротко и понятно, на русском.
+
+JSON-схема ответа:
+{
+  "questions": [
+    {
+      "id": "q1",                      // уникальный id в пределах ответа
+      "section_id": "bayes",           // как в секциях пользователя
+      "title": "Короткий заголовок",
+      "question": "Текст вопроса (1–3 предложения).",
+      "type": "mcq",
+      "options": { "A":"…", "B":"…", "C":"…", "D":"…" },
+      "answer": "A",
+      "explanation_md": "Короткое объяснение в Markdown."
+    }
+  ]
+}`;
+  } else {
+    return `You are a generator of beginner-friendly probability practice questions.
+Return JSON ONLY (no prose, no comments), matching the schema below.
+
+Generate 6 questions distributed over user-provided sections (keep section_id exactly).
+Each question: type "mcq", 4 options, one correct answer. Language: English.
+
+Schema:
+{
+  "questions": [
+    {
+      "id": "q1",
+      "section_id": "bayes",
+      "title": "Short title",
+      "question": "Problem text (1–3 sentences).",
+      "type": "mcq",
+      "options": { "A":"…", "B":"…", "C":"…", "D":"…" },
+      "answer": "A",
+      "explanation_md": "Short explanation in Markdown."
+    }
+  ]
+}`;
+  }
+}
+
+function buildUserPrompt(body) {
+  // Тело запроса с фронта: { sections: [{id,title,description,lessons:[...]}], count: 6 }
+  const count = Math.min(Math.max(Number(body?.count ?? 6), 1), 12);
+  const sections = Array.isArray(body?.sections) ? body.sections : [];
+  return JSON.stringify({
+    instruction:
+      LANG === "ru"
+        ? `Сгенерируй ${count} вопросов, равномерно используя эти секции.`
+        : `Generate ${count} questions, covering these sections evenly.`,
+    sections,
+    count,
+  });
+}
+
+// ====== DeepSeek вызов ======
+async function callDeepSeek(messages) {
+  const resp = await fetch(DS_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${DS_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: DS_MODEL,
+      messages,
+      temperature: 0.7,
+    }),
+  });
+
+  const head = await resp.text(); // читаем как текст (может быть обрамлено)
+  // Запишем в логи "голову" (первые 2к)
+  console.info("INFO: DeepSeek status =", resp.status);
+  console.info("INFO: DeepSeek raw body (head) =");
+  console.info(head.slice(0, 2000));
+
+  if (!resp.ok) {
+    throw new Error(`DeepSeek HTTP ${resp.status}`);
+  }
+
+  // Парсим нормальный JSON из тела DeepSeek API (внешняя оболочка)
+  let outer;
+  try {
+    outer = JSON.parse(head);
+  } catch {
+    // Бывает, что приходит уже «чистый» JSON-блок без API-оболочки (редко),
+    // попробуем выдрать внутренний JSON сразу.
+    const fallback = extractJSON(head);
+    if (fallback) return fallback;
+    throw new Error("Failed to parse DeepSeek API envelope");
+  }
+
+  const content = outer?.choices?.[0]?.message?.content ?? "";
+  const parsed = extractJSON(content);
+  if (!parsed) {
+    throw new Error("Failed to extract JSON from DeepSeek message");
+  }
+  return parsed;
+}
+
+// ====== Эндпоинты ======
+
+// Генерация вопросов
 app.post("/gen-questions", async (req, res) => {
   try {
-    const { sections = [], count = 6, language = "ru" } = req.body || {};
-    console.log("INFO: gen-questions body:", JSON.stringify({ sections, count }));
-
-    const sys = [
-      "Ты – генератор тренировочных задач по вероятности.",
-      "Отвечай СТРОГО JSON по примеру ниже, без лишнего текста, без комментариев и добавления что-то ещё.",
-      "Схема ответа:",
-      "{",
-      '  "questions": [',
-      "    {",
-      '      "id": "q1",',
-      '      "section_id": "bayes",',
-      '      "title": "Короткий заголовок",',
-      '      "question": "Формулировка задачи",',
-      '      "content_md": "Доп. контент (может быть пустым)",',
-      '      "type": "mcq",',
-      '      "options": { "A": "вариант", "B": "вариант", "C": "вариант", "D": "вариант" },',
-      '      "answer": "A",',
-      '      "explanation_md": "Краткое объяснение"',
-      "    }",
-      "  ]",
-      "}",
-      "Все значения — строки. !Отвечай строго по примеру!",
-    ].join("\n");
-
-    const user = [
-      `Язык: ${language}.`,
-      `Нужно сгенерировать ${count} вопросов. Разделы:`,
-      JSON.stringify(sections),
-      "Темы — базовые вероятности, Байес, матожидание, хвостовые риски, интуитивные ловушки.",
-    ].join("\n");
-
-    const dsResp = await fetch("https://api.deepseek.com/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${DS_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: DS_MODEL,
-        messages: [
-          { role: "system", content: sys },
-          { role: "user", content: user },
-        ],
-        temperature: 0.4,
-      }),
-    });
-
-    console.log("INFO: DeepSeek status =", dsResp.status);
-    const text = await dsResp.text();
-    console.log("INFO: DeepSeek raw body (head) =", text.slice(0, 500));
-
-    if (!dsResp.ok) {
-      return res.status(502).json({ error: "DeepSeek error", body: text });
+    const cacheKey = JSON.stringify(req.body || {});
+    const now = Date.now();
+    if (cache.key === cacheKey && cache.data && now - cache.ts < CACHE_MS) {
+      return res.json(cache.data);
     }
 
-    // иногда модель оборачивает JSON в ```json ... ```
-    const match = text.match(/```json\s*([\s\S]*?)```/i);
-    const jsonText = match ? match[1] : text;
+    console.info("INFO: gen-questions body:", JSON.stringify(req.body));
 
-    let data;
-    try {
-      data = JSON.parse(jsonText);
-    } catch (e) {
-      return res.status(500).json({ error: "JSON parse fail", body: text });
+    const system = buildSystemPrompt();
+    const user = buildUserPrompt(req.body);
+
+    const data = await callDeepSeek([
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ]);
+
+    // Быстрая валидация и нормализация options
+    const qs = Array.isArray(data?.questions) ? data.questions : [];
+    for (const q of qs) {
+      // приводим к ожидаемой фронтом форме
+      if (!q.options || Array.isArray(q.options)) {
+        // если прилетели массивом — превратим в A,B,C,D
+        const letters = ["A", "B", "C", "D"];
+        const obj = {};
+        (q.options || []).slice(0, 4).forEach((opt, i) => {
+          obj[letters[i]] = String(opt?.text ?? opt ?? "");
+        });
+        q.options = obj;
+      } else {
+        // убедимся, что значения — строки
+        for (const k of Object.keys(q.options)) {
+          q.options[k] = String(q.options[k]);
+        }
+      }
+      // страхуем поля
+      q.type = "mcq";
+      q.title = q.title ?? "";
+      q.question = q.question ?? "";
+      q.explanation_md = q.explanation_md ?? "";
     }
 
-    const questions = Array.isArray(data?.questions) ? data.questions : [];
-    const normalized = questions.map(normalizeQuestion);
+    const payload = { questions: qs };
 
-    CACHE.questions = normalized;
-    CACHE.at = Date.now();
-
-    console.log("DEBUG: cached", normalized.length, "questions");
-    res.json(normalized);
+    cache = { key: cacheKey, data: payload, ts: now };
+    console.debug("DEBUG: cached", qs.length, "questions");
+    res.json(payload);
   } catch (err) {
-    console.error("ERROR /gen-questions:", err);
-    res.status(500).json({ error: String(err) });
+    console.error("ERROR gen-questions:", err?.message || err);
+    res.status(500).json({ error: "GEN_QUESTIONS_FAIL" });
   }
 });
 
+// Проверка ответа
 app.post("/check-answer", async (req, res) => {
   try {
-    const { qid, userAnswer, confidence } = req.body || {};
-    const q = CACHE.questions.find((x) => x.id === qid);
-    if (!q) return res.status(404).json({ error: "question not found" });
+    const { qid, type, userAnswer, confidence, question } = req.body || {};
+    // В идеале фронт присылает весь вопрос, но достаточно correctAnswer
+    const correct = question?.answer ?? question?.correctAnswer;
 
-    const correct = String(userAnswer).trim() === String(q.answer).trim();
+    const isCorrect =
+      typeof correct === "string" && typeof userAnswer === "string"
+        ? correct.trim().toUpperCase() === userAnswer.trim().toUpperCase()
+        : false;
 
-    // опционально считаем Brier, если фронт передал confidence [0..1]
-    let brier = undefined;
-    if (typeof confidence === "number" && confidence >= 0 && confidence <= 1) {
-      const p = confidence;
-      const y = correct ? 1 : 0;
-      brier = (p - y) * (p - y);
-    }
+    const p = Math.min(Math.max(Number(confidence ?? 0.7), 0), 1);
+    const y = isCorrect ? 1 : 0;
+    const brier = (p - y) * (p - y);
 
     res.json({
-      correct,
-      correctAnswer: q.answer,
+      correct: isCorrect,
+      correctAnswer: correct ?? null,
       brier,
-      explanation_md: q.explanation_md || "",
+      explanation_md: question?.explanation_md ?? "",
     });
   } catch (err) {
-    console.error("ERROR /check-answer:", err);
-    res.status(500).json({ error: String(err) });
+    console.error("ERROR check-answer:", err?.message || err);
+    res.status(500).json({ error: "CHECK_ANSWER_FAIL" });
   }
 });
 
-// === start ================================================================
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log("Server listening on port", port);
-  console.log("Model:", DS_MODEL);
+// ====== Start ======
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
